@@ -59,7 +59,13 @@ check_db_connection()
 # Home Route
 @app.route('/')
 def home():
-    return jsonify({"message": "Welcome to the Home Page"}), 200
+    return jsonify({"message": "Welcome to the Home Page of my App"}), 200
+
+
+# Home Route
+@app.route('/contact')
+def contact():
+    return jsonify({"message": "Welcome to the Contact Page of my App"}), 200
 
 # User Registration
 @app.route('/register', methods=['POST'])
