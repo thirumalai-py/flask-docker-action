@@ -64,20 +64,14 @@ jobs:
         run: |
           docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }} .
           docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
-          
+
   deploy:
+    name: Deploy to EC2
+    needs: build-and-push
     runs-on: ubuntu-latest
-    env:
-      ENVIRONMENT: ${{ github.ref_name }}
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Fix file permissions
-        run: |
-         sudo chmod -R u+rwX .
-
-      - name: SSH Into EC2 Instance
+      - name: SSH Into EC2 Instance and Deploy
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{secrets.EC2_HOST_IP}}
@@ -85,31 +79,43 @@ jobs:
           key: ${{secrets.EC2_SSH_KEY}}
           port: 22
           script: |
-            sudo mkdir -p /var/www/html/
-            sudo chown -R ${{secrets.EC2_USERNAME}} /var/www/html/
-            sudo chmod -R 755 /var/www/html/
+            IMAGE_NAME=${{ env.IMAGE_NAME }}
+            DOCKER_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME
+            DOCKER_TAG=${{ needs.build-and-push.outputs.tag }}
 
-      - name: Debug - List Files
-        run: |
-          ls -la
+            cho "Checking Docker network..."
+            docker network inspect ${DOCKER_NETWORK} > /dev/null 2>&1 || docker network create ${DOCKER_NETWORK}
 
-      - name: Copy Files to EC2
-        uses: appleboy/ssh-action@v1.0.0
-        with:
-          host: ${{secrets.EC2_HOST_IP}}
-          username: ${{secrets.EC2_USER_NAME}}
-          key: ${{secrets.EC2_SSH_KEY}}
-          port: 22
-          source: "*"
-          target: /var/www/html/
-        
-      - name: Debug - List Files
-        uses: appleboy/ssh-action@v1.0.0
-        with:
-          host: ${{secrets.EC2_HOST_IP}}
-          username: ${{secrets.EC2_USER_NAME}}
-          key: ${{secrets.EC2_SSH_KEY}}
-          port: 22
-          script: |
-            cd /var/www/html/
-            ls -la
+            echo "Checking Mongo volume..."
+            docker volume inspect flask_mongo_data > /dev/null 2>&1 || docker volume create flask_mongo_data
+            
+            echo "Checking MongoDB container..."
+            if ! docker ps -a --format '{{.Names}}' | grep -q '^mongo-db$'; then
+              docker run -d --name mongo-db --network ${DOCKER_NETWORK} \
+                -p 27017:27017 \
+                -v flask_mongo_data:/data/db \
+                -e MONGO_INITDB_DATABASE=flask_db_git \
+                mongo:latest
+            else
+              if ! docker ps --format '{{.Names}}' | grep -q '^mongo-db$'; then
+                docker start mongo-db
+              fi
+              docker network connect ${DOCKER_NETWORK} mongo-db || true
+            fi
+
+            echo "Pulling new Flask image..."
+            docker pull $DOCKER_IMAGE:$DOCKER_TAG
+
+            echo "Stopping old container..."
+            docker stop ${CONTAINER_NAME} || true
+            docker rm ${CONTAINER_NAME} || true
+
+            echo "Starting new Flask container..."
+            docker run -d --name ${CONTAINER_NAME} --network ${DOCKER_NETWORK} \
+              -p 8000:8000 \
+              -e MONGO_URI=mongodb://mongo-db:27017/flask_db_git \
+              -e JWT_SECRET_KEY=thirumalaipy \
+              -e MONGO_DB_NAME=flask_db_git \
+              $DOCKER_IMAGE:$DOCKER_TAG
+
+            echo "Deployment complete."
