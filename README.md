@@ -30,14 +30,23 @@ This is a Flask web application configured with Docker and automated CI/CD using
 The GitHub Actions workflow (`main.yml`) implements the following stages:
 
 ### 1. Test Stage
-- Runs on every push to `main` and `prod` branches
+- Runs on every push to `main` branch and for `prod` branch it will trigger on release tag push
 - Builds and runs tests using Docker Compose
 - Ensures code quality before proceeding to build
+
+#### Test Stage Screenshot
+![Test Stage Success](/output/1_test_success.png)
+
+#### Test Stage Console output
+![Deployment Stage Success](/output/2_test_success_result.png)
 
 ### 2. Build and Push Stage
 - Builds Docker image
 - Pushes image to DockerHub
 - Tags image with git commit hash or tag
+
+#### Build and Push Stage
+![Build and Push Stage](/output/3_build_and_push.png)
 
 ### 3. Deployment Stages
 #### Staging Deployment
@@ -46,10 +55,36 @@ The GitHub Actions workflow (`main.yml`) implements the following stages:
 - Sets up Docker network and MongoDB
 - Pulls and runs the latest image
 
+#### Output - Staging Deployment Success
+
+![Staging Deployment Stage](/output/4_staging_deployment_success.png)
+
+#### Output - Staging Deployment Console Success
+
+![Staging Deployment Stage](/output/5_staging_deployment_sucess_details.png)
+
+#### Output - EC2 Containers Running with Images
+
+![Docker Staging Containers and Images](/output/6_docker_staging_containers_images.png)
+
+#### Output - Docker Staging Containers and Images
+
+![Staging Deployment Overall Success](/output/7_staging_success_overall.png)
+
+
 #### Production Deployment
 - Triggered on version tags (e.g., `v1.0.0`)
 - Deploys to production EC2 instance
 - Similar setup to staging with production-specific configurations
+
+#### Output - Production Deployment Success - without Staging Not Deployed
+
+![Production Deployment Stage](/output/8_deploy_to_prod.png)
+
+#### Output - Docker Staging Containers and Images
+
+![Production Deployment Docker Containers and Images](/output/9_deploy_to_prod.png)
+
 
 ## Environment Variables
 - `MONGO_URI`: MongoDB connection string
