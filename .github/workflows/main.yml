@@ -4,14 +4,12 @@ on:
   push:
     branches:
       - main
-      - staging
     tags:
-      - '*'
+      - 'v*'         # Tags like v1.0.0 trigger prod deploy
 
   pull_request:
     branches:
-      - main
-      - staging
+      - prod         # Required so it runs test/build before merge to prod
 
 env:
   IMAGE_NAME: flask-github-actions
@@ -20,110 +18,151 @@ env:
   MONGO_VOLUME: flask_mongo_data
 
 jobs:
-  test:
-    name: Test Flask Application
+  install-and-test:
+    name: Install & Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up docker compose
-        run: |
-          sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-          sudo chmod +x /usr/local/bin/docker-compose
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
 
-      - name: Build Docker image
+      - name: Install dependencies
         run: |
-          docker-compose up --build --abort-on-container-exit --exit-code-from test
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          pip install pytest
+          pytest
 
   build-and-push:
-    name: Build and Push Docker Image
-    needs: test
+    name: Build & Push Docker Image
+    needs: install-and-test
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
-
+      tag: ${{ steps.set-tag.outputs.tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract Image Tag
-        id: tag
+      - name: Set Docker Tag
+        id: set-tag
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             echo "tag=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
           else
             echo "tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Build and push Docker image
+          
+      - name: Build & Push Image
         run: |
-          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }} .
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.set-tag.outputs.tag }} .
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.set-tag.outputs.tag }}
 
-  deploy:
-    name: Deploy to EC2
+  deploy-to-staging:
+    name: Deploy to Staging
+    if: github.ref == 'refs/heads/main'
     needs: build-and-push
     runs-on: ubuntu-latest
-
     steps:
-      - name: SSH Into EC2 Instance and Deploy
+      - name: SSH and deploy to staging EC2
         uses: appleboy/ssh-action@v1.0.0
         with:
-          host: ${{secrets.EC2_HOST_IP}}
-          username: ${{secrets.EC2_USER_NAME}}
-          key: ${{secrets.EC2_SSH_KEY}}
-          port: 22
+          host: ${{ secrets.EC2_HOST_IP }}
+          username: ${{ secrets.EC2_USER_NAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             IMAGE_NAME=${{ env.IMAGE_NAME }}
             DOCKER_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME
             DOCKER_TAG=${{ needs.build-and-push.outputs.tag }}
             DOCKER_NETWORK=${{ env.DOCKER_NETWORK }}
             CONTAINER_NAME=${{ env.CONTAINER_NAME }}
-            JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
+            MONGO_VOLUME=${{ env.MONGO_VOLUME }}
 
             echo "Checking Docker network..."
             docker network inspect ${DOCKER_NETWORK} > /dev/null 2>&1 || docker network create ${DOCKER_NETWORK}
 
             echo "Checking Mongo volume..."
             docker volume inspect ${MONGO_VOLUME} > /dev/null 2>&1 || docker volume create ${MONGO_VOLUME}
-            
+
             echo "Checking MongoDB container..."
             if ! docker ps -a --format '{{.Names}}' | grep -q '^mongo-db$'; then
               docker run -d --name mongo-db --network ${DOCKER_NETWORK} \
                 -p 27017:27017 \
                 -v ${MONGO_VOLUME}:/data/db \
-                -e MONGO_INITDB_DATABASE=flask_db_git \
+                -e MONGO_INITDB_DATABASE=flask_db_staging \
                 mongo:latest
             else
-              if ! docker ps --format '{{.Names}}' | grep -q '^mongo-db$'; then
-                docker start mongo-db
-              fi
+              docker start mongo-db || true
               docker network connect ${DOCKER_NETWORK} mongo-db || true
             fi
 
-            echo "Pulling new Flask image..."
+            echo "Deploying Flask container..."
             docker pull $DOCKER_IMAGE:$DOCKER_TAG
-
-            echo "Stopping old container..."
-            docker stop ${CONTAINER_NAME} || true
-            docker rm ${CONTAINER_NAME} || true
-
-            echo "Starting new Flask container..."
-            docker run -d --name ${CONTAINER_NAME} --network ${DOCKER_NETWORK} \
+            docker stop $CONTAINER_NAME || true
+            docker rm $CONTAINER_NAME || true
+            docker run -d --name $CONTAINER_NAME --network $DOCKER_NETWORK \
               -p 8000:8000 \
-              -e MONGO_URI=mongodb://mongo-db:27017/flask_db_git \
-              -e JWT_SECRET_KEY=${JWT_SECRET_KEY} \
-              -e MONGO_DB_NAME=flask_db_git \
+              -e MONGO_URI=mongodb://mongo-db:27017/flask_db_staging \
+              -e JWT_SECRET_KEY=staging_secret \
+              -e MONGO_DB_NAME=flask_db_staging \
               $DOCKER_IMAGE:$DOCKER_TAG
 
-            echo "Pruning Docker system..."
-            docker system prune -af
+  deploy-to-production:
+    name: Deploy to Production
+    if: startsWith(github.ref, 'refs/tags/v') && github.base_ref == 'prod'
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH and deploy to production EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.PROD_EC2_HOST_IP }}
+          username: ${{ secrets.EC2_USER_NAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            IMAGE_NAME=${{ env.IMAGE_NAME }}
+            DOCKER_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME
+            DOCKER_TAG=${{ needs.build-and-push.outputs.tag }}
+            DOCKER_NETWORK=${{ env.DOCKER_NETWORK }}
+            CONTAINER_NAME=${{ env.CONTAINER_NAME }}
+            MONGO_VOLUME=${{ env.MONGO_VOLUME }}
 
-            echo "Deployment complete."
+            echo "Checking Docker network..."
+            docker network inspect ${DOCKER_NETWORK} > /dev/null 2>&1 || docker network create ${DOCKER_NETWORK}
+
+            echo "Checking Mongo volume..."
+            docker volume inspect ${MONGO_VOLUME} > /dev/null 2>&1 || docker volume create ${MONGO_VOLUME}
+
+            echo "Checking MongoDB container..."
+            if ! docker ps -a --format '{{.Names}}' | grep -q '^mongo-db$'; then
+              docker run -d --name mongo-db --network ${DOCKER_NETWORK} \
+                -p 27017:27017 \
+                -v ${MONGO_VOLUME}:/data/db \
+                -e MONGO_INITDB_DATABASE=flask_db_prod \
+                mongo:latest
+            else
+              docker start mongo-db || true
+              docker network connect ${DOCKER_NETWORK} mongo-db || true
+            fi
+
+            echo "Deploying Flask container..."
+            docker pull $DOCKER_IMAGE:$DOCKER_TAG
+            docker stop $CONTAINER_NAME || true
+            docker rm $CONTAINER_NAME || true
+            docker run -d --name $CONTAINER_NAME --network $DOCKER_NETWORK \
+              -p 8000:8000 \
+              -e MONGO_URI=mongodb://mongo-db:27017/flask_db_prod \
+              -e JWT_SECRET_KEY=prod_secret \
+              -e MONGO_DB_NAME=flask_db_prod \
+              $DOCKER_IMAGE:$DOCKER_TAG
